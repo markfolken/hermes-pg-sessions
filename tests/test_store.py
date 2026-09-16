@@ -126,6 +126,42 @@ def test_flush_without_connection_is_safe(store: PGSessionStore) -> None:
     store.flush()
 
 
+def test_public_methods_never_raise_without_connection(store: PGSessionStore) -> None:
+    """Regression: _get_conn() raising inside a public method used to escape
+    into the agent loop. Every entry point must degrade to an error payload.
+
+    Reachable in production when the pool dies between the _connected check
+    and the query — e.g. Neon auto-pausing, or pool exhaustion under load.
+    """
+    import json
+
+    # Void methods must simply return
+    store.create_session("s1", platform="cli")
+    store.end_session("s1", status="completed")
+
+    # Read methods must return a JSON error, not raise
+    for payload in (
+        store.query_sessions(),
+        store.get_session("s1"),
+        store.get_stats(),
+    ):
+        data = json.loads(payload)
+        assert "error" in data, data
+        assert "unavailable" in data["error"]
+
+
+def test_try_conn_returns_none_and_trips_breaker_when_unconnected(store: PGSessionStore) -> None:
+    """_try_conn() reports failure via the breaker instead of raising."""
+    assert store._try_conn() is None
+    assert store._consecutive_failures == 1
+
+
+def test_try_conn_is_non_raising_by_contract(store: PGSessionStore) -> None:
+    for _ in range(store_module._BREAKER_THRESHOLD + 2):
+        store._try_conn()  # must never raise
+    assert store._is_breaker_open() is True
+
+
 def test_shutdown_is_idempotent(store: PGSessionStore) -> None:
     store.shutdown()
     store.shutdown()

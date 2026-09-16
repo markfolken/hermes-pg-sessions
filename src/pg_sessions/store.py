@@ -14,6 +14,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,10 @@ logger = logging.getLogger("plugins.pg-sessions.store")
 # --- Circuit breaker ---
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
+
+# Cap on buffered turns waiting on a flush. Bounds memory during an outage —
+# beyond this, the oldest pending turns are dropped rather than growing forever.
+_MAX_PENDING_TURNS = 5000
 
 
 class PGSessionStore:
@@ -234,6 +239,21 @@ class PGSessionStore:
         finally:
             self._put_conn(conn)
 
+    def _try_conn(self):
+        """Return a pooled connection, or None — never raises.
+
+        Public methods use this instead of ``_get_conn()`` so a backend that
+        disappears mid-session (Neon auto-pause, pool exhaustion, network drop)
+        degrades to an error payload rather than an exception escaping into the
+        agent loop.
+        """
+        try:
+            return self._get_conn()
+        except Exception as exc:  # noqa: BLE001
+            self._record_failure(exc)
+            logger.warning("pg-sessions: connection unavailable: %s", exc)
+            return None
+
     def flush(self) -> None:
         """Synchronously flush all pending turns. Blocks until done."""
         with self._sync_lock:
@@ -250,7 +270,9 @@ class PGSessionStore:
         if self._is_breaker_open():
             return
 
-        conn = self._get_conn()
+        conn = self._try_conn()
+        if conn is None:
+            return
         try:
             cur = conn.cursor()
             cur.execute(
@@ -266,7 +288,8 @@ class PGSessionStore:
             conn.commit()
             self._record_success()
         except Exception as exc:
-            conn.rollback()
+            with suppress(Exception):
+                conn.rollback()
             self._record_failure(exc)
             logger.warning("pg-sessions: create_session failed: %s", exc)
         finally:
@@ -295,16 +318,25 @@ class PGSessionStore:
         }
 
         with self._pending_lock:
+            if len(self._pending_turns) >= _MAX_PENDING_TURNS:
+                # Outage backpressure: drop the oldest rather than grow unbounded.
+                self._pending_turns.pop(0)
             self._pending_turns.append(turn)
 
         # Spawn daemon thread for non-blocking flush
         def _flush():
-            with self._sync_lock:
-                prev = self._sync_thread
-                if prev and prev is not threading.current_thread() and prev.is_alive():
-                    prev.join(timeout=5.0)
-                self._batch_insert()
-                self._update_session_turn_count(session_id)
+            # Backstop: this runs on a daemon thread with nobody to catch a
+            # raise. An unhandled exception here would print a traceback and
+            # silently drop the turn, so swallow everything.
+            try:
+                with self._sync_lock:
+                    prev = self._sync_thread
+                    if prev and prev is not threading.current_thread() and prev.is_alive():
+                        prev.join(timeout=5.0)
+                    self._batch_insert()
+                    self._update_session_turn_count(session_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("pg-sessions: flush thread swallowed error: %s", exc)
 
         t = threading.Thread(target=_flush, daemon=True, name="pg-sessions-sync")
         with self._sync_lock:
@@ -312,15 +344,22 @@ class PGSessionStore:
         t.start()
 
     def _batch_insert(self) -> None:
-        """Flush all pending turns in one batch INSERT."""
+        """Flush all pending turns in one batch INSERT.
+
+        Never raises: failures re-queue the turns so a later flush can retry.
+        """
         with self._pending_lock:
             if not self._pending_turns:
                 return
             turns = list(self._pending_turns)
             self._pending_turns.clear()
 
-        conn = self._get_conn()
+        conn = None
         try:
+            # _get_conn() must be inside the try — when the backend is gone it
+            # raises, and an escape here would kill the daemon thread and drop
+            # the buffered turns on the floor.
+            conn = self._get_conn()
             cur = conn.cursor()
             import psycopg2.extras
             psycopg2.extras.execute_values(
@@ -343,14 +382,20 @@ class PGSessionStore:
             conn.commit()
             self._record_success()
         except Exception as exc:
-            conn.rollback()
+            if conn is not None:
+                with suppress(Exception):
+                    conn.rollback()
             self._record_failure(exc)
             logger.warning("pg-sessions: batch_insert failed: %s", exc)
-            # Re-queue failed turns
+            # Re-queue failed turns (bounded, so an outage cannot grow unbounded)
             with self._pending_lock:
-                self._pending_turns[:0] = turns
+                room = _MAX_PENDING_TURNS - len(self._pending_turns)
+                if room > 0:
+                    self._pending_turns[:0] = turns[:room]
         finally:
-            self._put_conn(conn)
+            if conn is not None:
+                with suppress(Exception):
+                    self._put_conn(conn)
 
     def _update_session_turn_count(self, session_id: str) -> None:
         """Update the turn count on the session record."""
@@ -384,7 +429,9 @@ class PGSessionStore:
         # Flush any remaining pending turns first
         self.flush()
 
-        conn = self._get_conn()
+        conn = self._try_conn()
+        if conn is None:
+            return
         try:
             cur = conn.cursor()
             cur.execute(
@@ -402,7 +449,8 @@ class PGSessionStore:
             conn.commit()
             self._record_success()
         except Exception as exc:
-            conn.rollback()
+            with suppress(Exception):
+                conn.rollback()
             self._record_failure(exc)
             logger.warning("pg-sessions: end_session failed: %s", exc)
         finally:
@@ -419,7 +467,9 @@ class PGSessionStore:
 
         self.flush()
 
-        conn = self._get_conn()
+        conn = self._try_conn()
+        if conn is None:
+            return json.dumps({"error": "storage unavailable (no database connection)"})
         try:
             cur = conn.cursor()
             params = []
@@ -497,7 +547,9 @@ class PGSessionStore:
 
         self.flush()
 
-        conn = self._get_conn()
+        conn = self._try_conn()
+        if conn is None:
+            return json.dumps({"error": "storage unavailable (no database connection)"})
         try:
             cur = conn.cursor()
 
@@ -574,7 +626,9 @@ class PGSessionStore:
 
         self.flush()
 
-        conn = self._get_conn()
+        conn = self._try_conn()
+        if conn is None:
+            return json.dumps({"error": "storage unavailable (no database connection)"})
         try:
             cur = conn.cursor()
             params_single = []
