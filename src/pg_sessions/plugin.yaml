@@ -1,0 +1,31 @@
+name: pg-sessions
+version: 1.0.0
+kind: standalone
+manifest_version: 2
+api_version: 1
+license: MIT
+author: Mark Folken
+description: "Store Hermes session history and conversation turns in PostgreSQL — Neon, Supabase, Aiven, RDS, and standard PostgreSQL"
+homepage: https://github.com/markfolken/hermes-pg-sessions
+repository: https://github.com/markfolken/hermes-pg-sessions
+
+provides_tools:
+  - sessions_query
+  - sessions_get
+  - sessions_stats
+  - sessions_migrate
+
+provides_hooks:
+  - on_session_start
+  - post_llm_call
+  - on_session_end
+  - on_session_reset
+
+provides_commands:
+  - pg-sessions
+
+requires_env:
+  - PG_SESSIONS_URL
+
+pip_dependencies:
+  - psycopg2-binary>=2.9.0
